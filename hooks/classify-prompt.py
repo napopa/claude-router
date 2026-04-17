@@ -7,6 +7,7 @@ Classifies prompts using hybrid approach:
 
 Part of claude-router: https://github.com/0xrdan/claude-router
 """
+from __future__ import annotations
 import json
 import sys
 import os
