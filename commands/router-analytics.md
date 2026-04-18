@@ -19,8 +19,8 @@ Generate a visual HTML analytics dashboard from your routing statistics.
 Reads `~/.claude/router-stats.json` and generates an HTML dashboard with:
 - Route distribution pie chart
 - Daily/weekly trends line chart
-- Cost savings over time
-- Session comparison metrics
+- Queries per session over time
+- Optimization rate tracking
 
 ## Output
 

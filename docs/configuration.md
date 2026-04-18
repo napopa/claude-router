@@ -34,7 +34,7 @@ Models: `haiku`/`fast`, `sonnet`/`standard`, `opus`/`deep`
 
 #### `/router-stats`
 
-View your routing statistics and cost savings:
+View your routing statistics:
 
 ```
 /router-stats
@@ -96,7 +96,7 @@ Generate interactive HTML analytics dashboard:
 Generates charts for:
 - Route distribution
 - Daily/weekly trends
-- Cost savings
+- Optimization rate
 
 ---
 

@@ -2,6 +2,15 @@
 
 All notable changes to Claude Router will be documented in this file.
 
+## [2.0.9] - 2026-04-18
+
+### Changed
+- **Removed misleading savings reporting.** Stats no longer accumulate `estimated_savings` or `delegation_savings` at classification time — the router cannot verify that routing directives were actually followed, so reporting dollar savings was misleading. Stats now only record factual route counts.
+- **Schema bumped to v1.3.** Stale savings fields (`estimated_savings`, `delegation_savings`, `assumptions`) are stripped on first write. Session objects no longer carry a `savings` field.
+- **Stats display simplified.** `/router-stats` and `/router-analytics` show route distribution and optimization rate (% classified to cheaper models) without dollar figures.
+
+---
+
 ## [2.0.8] - 2026-04-17
 
 ### Changed

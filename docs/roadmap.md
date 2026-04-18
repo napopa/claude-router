@@ -26,7 +26,7 @@
 - Opus Orchestrator mode for complex multi-step tasks
 - Smart delegation: Opus handles strategy, spawns Haiku/Sonnet for subtasks
 - Escalation paths: Sonnet can recommend Opus for architectural decisions
-- Enhanced cost tracking with delegation metrics (~40% additional savings)
+- Opus Orchestrator delegation (~40% additional savings on complex tasks)
 
 ### Phase 6: Knowledge System (v1.4.0)
 - Persistent knowledge base that survives session boundaries and context compaction
@@ -71,7 +71,7 @@ Dynamic routing rule creation via hookify:
 ## What Makes People Use It
 
 1. **Zero-config start** - Works immediately with sensible defaults
-2. **Visible savings** - Use `/router-stats` to see your cost savings
+2. **Visible routing** - Use `/router-stats` to see your route distribution
 3. **Trust through transparency** - Every routing decision is explained
 4. **Easy override** - `/route <model>` to force any model when needed
 5. **Learns from feedback** - Future: adjust routing based on user overrides

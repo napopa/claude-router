@@ -39,16 +39,6 @@ CONFIDENCE_THRESHOLD = 0.7
 # Stats file location
 STATS_FILE = Path.home() / ".claude" / "router-stats.json"
 
-# Cost estimates per 1M tokens (input/output)
-COST_PER_1M = {
-    "fast": {"input": 1.0, "output": 5.0},        # Haiku 4.5
-    "standard": {"input": 3.0, "output": 15.0},   # Sonnet 4.5
-    "deep": {"input": 5.0, "output": 25.0},       # Opus 4.5
-}
-
-# Average tokens per query (rough estimate)
-AVG_INPUT_TOKENS = 1000
-AVG_OUTPUT_TOKENS = 2000
 
 # Exception patterns - queries that will be handled by Opus despite classification
 # (router meta-questions, slash commands handled in main())
@@ -613,39 +603,25 @@ def get_api_key():
     return None
 
 
-def calculate_cost(route: str, input_tokens: int = AVG_INPUT_TOKENS, output_tokens: int = AVG_OUTPUT_TOKENS) -> float:
-    """Calculate estimated cost for a route."""
-    costs = COST_PER_1M[route]
-    input_cost = (input_tokens / 1_000_000) * costs["input"]
-    output_cost = (output_tokens / 1_000_000) * costs["output"]
-    return input_cost + output_cost
-
-
 def log_routing_decision(route: str, confidence: float, method: str, signals: list, metadata: dict = None):
-    """Log routing decision to stats file with optional metadata tracking."""
+    """Log routing decision to stats file with optional metadata tracking.
+
+    Only records factual data: route counts and query metadata.
+    Savings are NOT accumulated here — they are computed on-the-fly
+    by the stats display from the route distribution.
+    """
     try:
         # Ensure directory exists
         STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        # Load existing stats or create new (v1.2 schema with exception tracking)
-        # estimated_savings/delegation_savings are *estimates* derived from the
-        # fixed AVG_INPUT_TOKENS/AVG_OUTPUT_TOKENS assumption below — they are
-        # NOT a measurement of real token usage. The assumptions block
-        # surfaces that so stats consumers can label the numbers honestly.
+        # Load existing stats or create new (v1.3 schema — no accumulated savings)
         stats = {
-            "version": "1.2",
+            "version": "1.3",
             "total_queries": 0,
             "routes": {"fast": 0, "standard": 0, "deep": 0, "orchestrated": 0},
             "exceptions": {"router_meta": 0, "slash_commands": 0},
             "tool_intensive_queries": 0,
             "orchestrated_queries": 0,
-            "estimated_savings": 0.0,
-            "delegation_savings": 0.0,
-            "assumptions": {
-                "avg_input_tokens": AVG_INPUT_TOKENS,
-                "avg_output_tokens": AVG_OUTPUT_TOKENS,
-                "note": "Savings are ESTIMATES based on fixed per-query token averages, not measured token counts.",
-            },
             "sessions": [],
             "last_updated": None
         }
@@ -659,18 +635,17 @@ def log_routing_decision(route: str, confidence: float, method: str, signals: li
             except (json.JSONDecodeError, IOError):
                 pass
 
-        # Ensure v1.2 schema fields exist (migration from v1.0/v1.1)
-        stats.setdefault("version", "1.2")
+        # Migrate: drop stale savings fields from older schemas
+        stats.pop("estimated_savings", None)
+        stats.pop("delegation_savings", None)
+        stats.pop("assumptions", None)
+
+        # Ensure v1.3 schema fields exist
+        stats["version"] = "1.3"
         stats.setdefault("routes", {}).setdefault("orchestrated", 0)
         stats.setdefault("exceptions", {"router_meta": 0, "slash_commands": 0})
         stats.setdefault("tool_intensive_queries", 0)
         stats.setdefault("orchestrated_queries", 0)
-        stats.setdefault("delegation_savings", 0.0)
-        stats.setdefault("assumptions", {
-            "avg_input_tokens": AVG_INPUT_TOKENS,
-            "avg_output_tokens": AVG_OUTPUT_TOKENS,
-            "note": "Savings are ESTIMATES based on fixed per-query token averages, not measured token counts.",
-        })
 
         # Update stats
         stats["total_queries"] += 1
@@ -692,18 +667,6 @@ def log_routing_decision(route: str, confidence: float, method: str, signals: li
         if metadata.get("tool_intensive"):
             stats["tool_intensive_queries"] += 1
 
-        # Calculate savings (compared to always using Opus)
-        actual_cost = calculate_cost(route)
-        opus_cost = calculate_cost("deep")
-        savings = opus_cost - actual_cost
-        stats["estimated_savings"] += savings
-
-        # Calculate delegation savings for orchestrated queries
-        # Assumes 60% delegation (70% Haiku, 30% Sonnet) saves ~40% vs pure Opus
-        if metadata.get("orchestration"):
-            delegation_saving = opus_cost * 0.4  # ~40% savings through delegation
-            stats["delegation_savings"] += delegation_saving
-
         # Get or create today's session
         today = datetime.now().strftime("%Y-%m-%d")
         session = None
@@ -716,14 +679,13 @@ def log_routing_decision(route: str, confidence: float, method: str, signals: li
             session = {
                 "date": today,
                 "queries": 0,
-                "routes": {"fast": 0, "standard": 0, "deep": 0},
-                "savings": 0.0
+                "routes": {"fast": 0, "standard": 0, "deep": 0}
             }
             stats.setdefault("sessions", []).append(session)
 
         session["queries"] += 1
         session["routes"][route] += 1
-        session["savings"] += savings
+        session.pop("savings", None)
 
         # Keep only last 30 days of sessions
         stats["sessions"] = sorted(stats["sessions"], key=lambda x: x["date"], reverse=True)[:30]
