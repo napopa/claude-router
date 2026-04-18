@@ -140,11 +140,18 @@ def get_session_state() -> dict:
         return {"last_route": None, "conversation_depth": 0}
 
 
-def update_session_state(route: str, metadata: dict = None):
-    """Update session state after a routing decision."""
+def update_session_state(route: str, metadata: dict = None, state: dict = None):
+    """Update session state after a routing decision.
+
+    If ``state`` is provided, reuse it instead of re-reading from disk.
+    classify_hybrid() already loads session state for context-boost logic,
+    so threading it through here collapses two disk reads into one per hook
+    invocation.
+    """
     try:
         SESSION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        state = get_session_state()
+        if state is None:
+            state = get_session_state()
         state["last_route"] = route
         state["last_query_time"] = datetime.now().timestamp()
         state["conversation_depth"] = state.get("conversation_depth", 0) + 1
@@ -839,8 +846,43 @@ def classify_by_rules(prompt: str) -> dict:
     if fast_signals:  # One fast signal
         return {"route": "fast", "confidence": 0.7, "signals": fast_signals, "method": "rules"}
 
-    # Default to fast with low confidence - cheaper when uncertain
+    # Default to fast. For short prompts (rarely genuinely complex), use a
+    # confidence above CONFIDENCE_THRESHOLD so we skip the Haiku fallback —
+    # it would cost more than it saves on a one-liner question. Longer
+    # prompts with no pattern hit stay at low confidence so the LLM gets a
+    # chance to reclassify them.
+    if len(prompt) <= SHORT_PROMPT_CHARS:
+        return {
+            "route": "fast",
+            "confidence": 0.75,
+            "signals": ["short prompt, no strong patterns"],
+            "method": "rules",
+        }
     return {"route": "fast", "confidence": 0.5, "signals": ["no strong patterns"], "method": "rules"}
+
+
+# Prompt length cutoffs
+# Short prompts rarely benefit from Haiku classification — they are either
+# clearly simple ("list files", "what is X") or clearly routed by rules.
+# Giving them elevated default confidence skips the LLM fallback entirely.
+SHORT_PROMPT_CHARS = 200
+# For longer prompts we still run the LLM fallback, but the middle of a
+# 10KB stack trace adds no classification signal. Head+tail is enough.
+LLM_HEAD_CHARS = 500
+LLM_TAIL_CHARS = 200
+
+
+def truncate_for_llm(prompt: str) -> str:
+    """Head + tail truncation for the LLM classifier.
+
+    Haiku doesn't need the middle of a stack trace to decide a route.
+    Caps a pasted 10KB blob at ~700 chars + a marker line.
+    """
+    if len(prompt) <= LLM_HEAD_CHARS + LLM_TAIL_CHARS:
+        return prompt
+    head = prompt[:LLM_HEAD_CHARS]
+    tail = prompt[-LLM_TAIL_CHARS:]
+    return f"{head}\n...[{len(prompt) - LLM_HEAD_CHARS - LLM_TAIL_CHARS} chars elided]...\n{tail}"
 
 
 def classify_by_llm(prompt: str, api_key: str) -> dict:
@@ -855,9 +897,11 @@ def classify_by_llm(prompt: str, api_key: str) -> dict:
 
     client = Anthropic(api_key=api_key)
 
+    truncated = truncate_for_llm(prompt)
+
     classification_prompt = f"""Classify this coding query into exactly one route. Return ONLY valid JSON, no other text.
 
-Query: "{prompt}"
+Query: "{truncated}"
 
 Routes:
 - "fast": Simple factual questions, syntax lookups, formatting, git status, JSON/YAML manipulation
@@ -899,10 +943,13 @@ Return JSON only:
         return None
 
 
-def classify_hybrid(prompt: str) -> dict:
+def classify_hybrid(prompt: str, session_state: dict = None) -> dict:
     """
     Hybrid classification: cache first, then rules, then LLM fallback,
     then learned adjustments, then context boost.
+
+    ``session_state`` is passed in by main() so the hook reads
+    router-session.json at most once per invocation.
     """
     # Step 0: Check cache for similar query (instant)
     cached = check_classification_cache(prompt)
@@ -913,7 +960,8 @@ def classify_hybrid(prompt: str) -> dict:
     result = classify_by_rules(prompt)
 
     # Step 2: Check for multi-turn context (follow-up queries)
-    session_state = get_session_state()
+    if session_state is None:
+        session_state = get_session_state()
     follow_up = is_follow_up_query(prompt)
     if follow_up:
         result = apply_context_boost(result, session_state, follow_up)
@@ -1034,8 +1082,11 @@ Task(subagent_type="claude-router:{subagent}", prompt="<last query from session>
     # Check for exception queries (router meta-questions)
     is_exception, exception_type = is_exception_query(prompt)
 
+    # Load session state once and thread it through classify + update below.
+    session_state = get_session_state()
+
     # Classify using hybrid approach
-    result = classify_hybrid(prompt)
+    result = classify_hybrid(prompt, session_state=session_state)
 
     route = result["route"]
     confidence = result["confidence"]
@@ -1053,7 +1104,8 @@ Task(subagent_type="claude-router:{subagent}", prompt="<last query from session>
     log_routing_decision(route, confidence, method, signals, metadata)
 
     # Update session state for multi-turn context awareness
-    update_session_state(route, metadata)
+    # (reuses the state we already loaded — no second read)
+    update_session_state(route, metadata, state=session_state)
 
     # Map route to subagent and model
     # Use opus-orchestrator for complex tasks with orchestration flag
