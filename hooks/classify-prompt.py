@@ -628,6 +628,10 @@ def log_routing_decision(route: str, confidence: float, method: str, signals: li
         STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
         # Load existing stats or create new (v1.2 schema with exception tracking)
+        # estimated_savings/delegation_savings are *estimates* derived from the
+        # fixed AVG_INPUT_TOKENS/AVG_OUTPUT_TOKENS assumption below — they are
+        # NOT a measurement of real token usage. The assumptions block
+        # surfaces that so stats consumers can label the numbers honestly.
         stats = {
             "version": "1.2",
             "total_queries": 0,
@@ -637,6 +641,11 @@ def log_routing_decision(route: str, confidence: float, method: str, signals: li
             "orchestrated_queries": 0,
             "estimated_savings": 0.0,
             "delegation_savings": 0.0,
+            "assumptions": {
+                "avg_input_tokens": AVG_INPUT_TOKENS,
+                "avg_output_tokens": AVG_OUTPUT_TOKENS,
+                "note": "Savings are ESTIMATES based on fixed per-query token averages, not measured token counts.",
+            },
             "sessions": [],
             "last_updated": None
         }
@@ -657,6 +666,11 @@ def log_routing_decision(route: str, confidence: float, method: str, signals: li
         stats.setdefault("tool_intensive_queries", 0)
         stats.setdefault("orchestrated_queries", 0)
         stats.setdefault("delegation_savings", 0.0)
+        stats.setdefault("assumptions", {
+            "avg_input_tokens": AVG_INPUT_TOKENS,
+            "avg_output_tokens": AVG_OUTPUT_TOKENS,
+            "note": "Savings are ESTIMATES based on fixed per-query token averages, not measured token counts.",
+        })
 
         # Update stats
         stats["total_queries"] += 1
