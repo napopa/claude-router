@@ -2,6 +2,21 @@
 
 All notable changes to Claude Router will be documented in this file.
 
+## [2.0.8] - 2026-04-17
+
+### Changed
+- **Routing directive slimmed.** Removed per-query confidence/method/signals from the injected context and embedded the user's query directly into the Task() invocation. Main-agent delegation turns now echo a single cache-stable line instead of reformatting the query.
+- **Orchestration trigger narrowed.** `opus-orchestrator` now requires a deep signal AND an orchestration signal to co-occur. Deep + tool-intensive alone routes to `deep-executor`.
+- **Opus orchestrator now requires a Context Brief** (goal, constraints, prior findings, scope) before the first delegation, and the example workflow now batches independent subtasks in parallel `Task()` calls instead of serializing.
+- **Hot-path I/O in the hook collapsed.** Session state is read once per invocation and threaded through `classify_hybrid` + `update_session_state`. LLM classifier input is truncated head+tail (~700 chars) before embedding — 10KB stack-trace pastes no longer inflate Haiku input tokens.
+- **Short-prompt cutoff.** Prompts under 200 chars with no pattern hit default to `fast@0.75`, above the 0.7 LLM-fallback threshold. Terse queries no longer unconditionally pay for a Haiku classifier call.
+- **Router stats honesty.** `router-stats.json` now emits an explicit `assumptions` block (`avg_input_tokens`, `avg_output_tokens`, note). The `/router-stats` skill labels savings as estimates in its output template.
+
+### Documentation
+- `skills/orchestrate/SKILL.md` documents the Context Brief contract so users understand what `context: fork` means in practice (fresh cold runs, not inherited conversation).
+
+---
+
 ## [2.0.7] - 2026-01-13
 
 ### Changed
