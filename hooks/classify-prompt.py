@@ -1051,30 +1051,19 @@ Task(subagent_type="claude-router:{subagent}", prompt="<last query from session>
         subagent = subagent_map[route]
         model = model_map[route]
 
-    signals_str = ", ".join(signals)
-
-    # Add metadata info to context
-    metadata_str = ""
-    if metadata.get("tool_intensive"):
-        metadata_str += " | Tool-intensive: Yes"
-    if metadata.get("orchestration"):
-        metadata_str += " | Orchestration: Yes"
-    if metadata.get("follow_up"):
-        metadata_str += " | Follow-up: Yes"
-    if metadata.get("context_boost"):
-        metadata_str += f" | Context: {metadata['context_boost']}"
-    if metadata.get("exception_type"):
-        metadata_str += f" | Exception: {metadata['exception_type']}"
-
-    context = f"""[Claude Router] MANDATORY ROUTING DIRECTIVE
-Route: {route} | Model: {model} | Confidence: {confidence:.0%} | Method: {method}{metadata_str}
-Signals: {signals_str}
-
-CRITICAL: You MUST use the Task tool NOW to spawn the "claude-router:{subagent}" subagent.
-Do NOT respond to the user directly. Do NOT skip this step. Delegate immediately.
-
-Example:
-Task(subagent_type="claude-router:{subagent}", prompt="<user's query>", description="Route to {model}")"""
+    # Minimal, cache-stable directive: static prefix + one dynamic line.
+    # Confidence/method/signals are diagnostic and already logged via
+    # log_routing_decision(); omitting them from the directive keeps the
+    # main agent's injected context byte-stable across routes of the same
+    # class and shrinks the delegation turn to a single Task() echo.
+    query_json = json.dumps(prompt)
+    context = (
+        "[Claude Router] ROUTING DIRECTIVE\n"
+        "Delegate this turn — do not answer the user yourself.\n"
+        "Invoke exactly one Task call, then stop:\n\n"
+        f'Task(subagent_type="claude-router:{subagent}", '
+        f'description="Route to {model}", prompt={query_json})'
+    )
 
     # Output as JSON with hookSpecificOutput for proper injection
     output = {
