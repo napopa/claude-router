@@ -48,11 +48,16 @@ Use `/orchestrate` when you have:
 ## How It Works
 
 1. Your task is passed to the Opus Orchestrator in a forked context
-2. Orchestrator analyzes and decomposes the task
-3. Simple subtasks are delegated to Haiku (fast, cheap)
-4. Moderate subtasks go to Sonnet (balanced)
-5. Complex analysis stays with Opus
-6. Results are synthesized and returned to your main conversation
+2. Orchestrator composes a **Context Brief** (goal, constraints, prior findings, scope) and prepends it to every delegation — cold subagents need that frame or they flail
+3. Independent subtasks are batched and dispatched in parallel (multiple `Task` calls in one message), not serialized
+4. Simple subtasks are delegated to Haiku (fast, cheap)
+5. Moderate subtasks go to Sonnet (balanced)
+6. Complex analysis stays with Opus
+7. Results are synthesized and returned to your main conversation
+
+### The Context Brief contract
+
+"Forked context" does not mean "subagents inherit your conversation" — each delegated `Task()` is a fresh cold run. The orchestrator compensates by producing a ≤200-token Brief up front and reusing it across delegations in a batch. That brief is what makes forking cheap instead of lossy: the subagent gets exactly the context it needs, nothing more.
 
 ## Cost Optimization
 

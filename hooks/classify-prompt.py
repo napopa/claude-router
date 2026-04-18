@@ -766,16 +766,31 @@ def classify_by_rules(prompt: str) -> dict:
             if deep_signals:
                 break
 
-    # Decision matrix: deep + tool_intensive + orchestration
-    if deep_signals and (tool_signals or orch_signals):
-        # Complex task needing orchestration - route to deep with orchestration flag
-        combined = deep_signals + tool_signals + orch_signals
+    # Decision matrix. Orchestration-to-opus-orchestrator is narrow: we only
+    # trigger it when a deep signal co-occurs with an *orchestration* signal
+    # (multi-step / for-each / explicit multi-task). deep+tool alone routes to
+    # deep-executor without the orchestration flag — tool-intensity is a
+    # parallelism hint for workers, not a reason to spin up an Opus
+    # orchestrator.
+    if deep_signals and orch_signals:
+        combined = deep_signals + orch_signals + tool_signals
         return {
             "route": "deep",
             "confidence": 0.95,
             "signals": combined[:4],
             "method": "rules",
             "metadata": {"orchestration": True, "tool_intensive": bool(tool_signals)}
+        }
+
+    if deep_signals and tool_signals:
+        # Deep analysis over many files/tests — deep-executor handles it directly
+        combined = deep_signals + tool_signals
+        return {
+            "route": "deep",
+            "confidence": 0.9,
+            "signals": combined[:4],
+            "method": "rules",
+            "metadata": {"tool_intensive": True}
         }
 
     if len(deep_signals) >= 2:
