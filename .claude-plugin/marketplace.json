@@ -1,0 +1,16 @@
+{
+  "name": "napopa-plugins",
+  "owner": {
+    "name": "napopa",
+    "url": "https://github.com/napopa"
+  },
+  "plugins": [
+    {
+      "name": "claude-router",
+      "description": "Intelligent model routing for Claude Code - routes queries to optimal Claude model (Haiku/Sonnet/Opus) based on complexity, with persistent knowledge system, context forking, and multi-turn awareness",
+      "category": "productivity",
+      "source": ".",
+      "homepage": "https://github.com/napopa/claude-router"
+    }
+  ]
+}
