@@ -1,11 +1,11 @@
 ---
 name: router-stats
-description: Display Claude Router usage statistics and cost savings (global across all projects)
+description: Display Claude Router usage statistics (global across all projects)
 ---
 
 # /router-stats Command
 
-Display usage statistics and estimated cost savings from Claude Router.
+Display usage statistics from Claude Router.
 
 **Note:** Stats are global - they track routing across all your projects.
 
@@ -28,16 +28,17 @@ Display usage statistics and estimated cost savings from Claude Router.
 The stats file contains:
 ```json
 {
-  "version": "1.0",
+  "version": "1.3",
   "total_queries": 100,
-  "routes": {"fast": 30, "standard": 60, "deep": 10},
-  "estimated_savings": 12.50,
+  "routes": {"fast": 30, "standard": 50, "deep": 10, "orchestrated": 10},
+  "exceptions": {"router_meta": 15, "slash_commands": 0},
+  "tool_intensive_queries": 25,
+  "orchestrated_queries": 10,
   "sessions": [
     {
       "date": "2026-01-03",
       "queries": 25,
-      "routes": {"fast": 8, "standard": 15, "deep": 2},
-      "savings": 3.20
+      "routes": {"fast": 8, "standard": 12, "deep": 2, "orchestrated": 3}
     }
   ],
   "last_updated": "2026-01-03T15:30:00"
@@ -55,45 +56,29 @@ Claude Router Statistics (Global)
 All Time
 --------
 Total Queries Routed: 100
-Optimization Rate: 90% (queries routed to cheaper models)
+Optimization Rate: 80% (queries classified to cheaper models)
 
 Route Distribution:
   Fast (Haiku):      30 (30%)
-  Standard (Sonnet): 60 (60%)
+  Standard (Sonnet): 50 (50%)
   Deep (Opus):       10 (10%)
-
-Value Metrics:
-  Estimated Savings: $12.50 (vs always using Opus)
-  Estimated Tokens Saved: ~2.7M tokens
-  Avg Cost per Query: $0.02 (vs $0.055 with Opus 4.5)
+  Orchestrated:      10 (10%)
 
 Today
 -----
 Queries: 25
-Savings: $3.20
-Routes: Fast 8 | Standard 15 | Deep 2
+Routes: Fast 8 | Standard 12 | Deep 2 | Orchestrated 3
 ```
 
 ## Why This Matters for Subscribers
 
-If you're on Claude Pro or Max, these metrics translate to real benefits:
+If you're on Claude Pro or Max, routing to smaller models:
 
-- **Extended usage limits** - Routing to smaller models uses less of your monthly capacity
+- **Extended usage limits** - Smaller models use less of your monthly capacity
 - **Longer sessions** - Less context consumed means fewer auto-compacts
 - **Faster responses** - Haiku responds 3-5x faster than Opus
 
 ## Metrics Explained
 
-- **Optimization Rate**: Percentage of queries routed to Haiku or Sonnet instead of Opus
-- **Estimated Savings**: Total cost saved compared to always using Opus (API users)
-- **Estimated Tokens Saved**: Approximate tokens conserved by using efficient models
-- **Avg Cost per Query**: Your actual average cost vs what Opus would cost
-
-## Cost Reference
-
-Model pricing per 1M tokens (input/output):
-- Haiku 4.5: $1 / $5
-- Sonnet 4.5: $3 / $15
-- Opus 4.5: $5 / $25
-
-Average query estimated at 1K input + 2K output tokens (~$0.055 with Opus 4.5).
+- **Optimization Rate**: Percentage of queries classified to Haiku or Sonnet instead of Opus. Reflects classification decisions, not confirmed execution.
+- **Route Distribution**: How queries were classified across models.
