@@ -2,6 +2,19 @@
 
 All notable changes to Claude Router will be documented in this file.
 
+## [2.1.1] - 2026-04-18
+
+### Fixed
+- **Exception queries no longer double-count.** Previously, prompts matching the `router_meta` / `slash_commands` exception paths bumped both `stats["exceptions"][<type>]` *and* `stats["total_queries"]` + `stats["routes"][<route>]` + session counters. `stats["exceptions"]` is now the sole tally for router-meta and slash-command prompts; they are excluded from `total_queries`, `routes`, `tool_intensive_queries`, `orchestrated_queries`, and per-day session totals.
+
+### Changed
+- **Stats schema bumped to v1.4.** Semantic change in what `total_queries` counts — exception queries are now excluded. The invariant `sum(routes.values()) == total_queries` holds under v1.4. No data-shape migration is required; historical counters written under v1.3 are left untouched.
+
+### Chore
+- `plugin.json` `author.name` updated from `Dan Monteiro` to `napopa` to match fork ownership.
+
+---
+
 ## [2.1.0] - 2026-04-19
 
 ### Changed

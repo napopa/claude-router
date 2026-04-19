@@ -623,9 +623,10 @@ def log_routing_decision(route: str, confidence: float, method: str, signals: li
         # Ensure directory exists
         STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        # Load existing stats or create new (v1.3 schema — no accumulated savings)
+        # Load existing stats or create new (v1.4 schema — exceptions
+        # separated from total_queries/routes; no accumulated savings)
         stats = {
-            "version": "1.3",
+            "version": "1.4",
             "total_queries": 0,
             "routes": {"fast": 0, "standard": 0, "deep": 0, "orchestrated": 0},
             "exceptions": {"router_meta": 0, "slash_commands": 0},
@@ -649,52 +650,61 @@ def log_routing_decision(route: str, confidence: float, method: str, signals: li
         stats.pop("delegation_savings", None)
         stats.pop("assumptions", None)
 
-        # Ensure v1.3 schema fields exist
-        stats["version"] = "1.3"
+        # Ensure v1.4 schema fields exist
+        # v1.4: exception queries no longer bump total_queries/routes; they
+        # only bump exceptions[exception_type]. No data-shape migration is
+        # needed from v1.3 — historical counts are not rewritten. The
+        # invariant sum(routes.values()) == total_queries now holds.
+        stats["version"] = "1.4"
         stats.setdefault("routes", {}).setdefault("orchestrated", 0)
         stats.setdefault("exceptions", {"router_meta": 0, "slash_commands": 0})
         stats.setdefault("tool_intensive_queries", 0)
         stats.setdefault("orchestrated_queries", 0)
 
-        # Update stats
-        stats["total_queries"] += 1
         metadata = metadata or {}
-
-        # Track exceptions (queries that bypass routing due to CLAUDE.md rules)
         exception_type = metadata.get("exception_type")
+
+        # Track exceptions (queries that bypass routing due to CLAUDE.md rules).
+        # Exception queries are tallied ONLY under stats["exceptions"]; they
+        # do not contribute to total_queries or routes (v1.4 semantics).
         if exception_type:
             stats["exceptions"][exception_type] = stats["exceptions"].get(exception_type, 0) + 1
-
-        # Track orchestrated vs regular routes
-        if metadata.get("orchestration") and route == "deep":
-            stats["routes"]["orchestrated"] += 1
-            stats["orchestrated_queries"] += 1
         else:
-            stats["routes"][route] += 1
+            # Update stats for non-exception queries only
+            stats["total_queries"] += 1
 
-        # Track tool-intensive queries
-        if metadata.get("tool_intensive"):
-            stats["tool_intensive_queries"] += 1
+            # Track orchestrated vs regular routes
+            if metadata.get("orchestration") and route == "deep":
+                stats["routes"]["orchestrated"] += 1
+                stats["orchestrated_queries"] += 1
+            else:
+                stats["routes"][route] += 1
 
-        # Get or create today's session
-        today = datetime.now().strftime("%Y-%m-%d")
-        session = None
-        for s in stats.get("sessions", []):
-            if s["date"] == today:
-                session = s
-                break
+            # Track tool-intensive queries
+            if metadata.get("tool_intensive"):
+                stats["tool_intensive_queries"] += 1
 
-        if not session:
-            session = {
-                "date": today,
-                "queries": 0,
-                "routes": {"fast": 0, "standard": 0, "deep": 0}
-            }
-            stats.setdefault("sessions", []).append(session)
+        # Get or create today's session (skip for exception queries —
+        # they do not count toward session totals in v1.4).
+        if not exception_type:
+            today = datetime.now().strftime("%Y-%m-%d")
+            session = None
+            for s in stats.get("sessions", []):
+                if s["date"] == today:
+                    session = s
+                    break
 
-        session["queries"] += 1
-        session["routes"][route] += 1
-        session.pop("savings", None)
+            if not session:
+                session = {
+                    "date": today,
+                    "queries": 0,
+                    "routes": {"fast": 0, "standard": 0, "deep": 0}
+                }
+                stats.setdefault("sessions", []).append(session)
+
+            session["queries"] += 1
+            session["routes"][route] += 1
+            session.pop("savings", None)
 
         # Keep only last 30 days of sessions
         stats["sessions"] = sorted(stats["sessions"], key=lambda x: x["date"], reverse=True)[:30]
