@@ -2,6 +2,16 @@
 
 All notable changes to Claude Router will be documented in this file.
 
+## [2.0.10] - 2026-04-18
+
+### Changed
+- **Plugin layout consolidated.** Removed the orphan `hooks/hooks.json` (byte-identical to the canonical `.claude-plugin/hooks/hooks.json`, unreferenced after the `b82d36f` layout move) and the dead `.claude-plugin/hooks/classify-prompt.py` copy (never referenced by any manifest; had silently drifted behind `hooks/classify-prompt.py`). The sole hook manifest is now `.claude-plugin/hooks/hooks.json`; the sole script is `hooks/classify-prompt.py`.
+- **Fork ownership corrected.** `plugin.json` `homepage` and `repository` now point to `napopa/claude-router` to match the active fork. No other metadata changed.
+
+No functional change.
+
+---
+
 ## [2.0.9] - 2026-04-18
 
 ### Changed

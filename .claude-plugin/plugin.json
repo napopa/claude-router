@@ -1,12 +1,12 @@
 {
   "name": "claude-router",
-  "version": "2.0.9",
+  "version": "2.0.10",
   "description": "Intelligent model routing for Claude Code - routes queries to optimal Claude model (Haiku/Sonnet/Opus) based on complexity, with persistent knowledge system, context forking, and multi-turn awareness",
   "author": {
     "name": "Dan Monteiro"
   },
-  "homepage": "https://github.com/0xrdan/claude-router",
-  "repository": "https://github.com/0xrdan/claude-router",
+  "homepage": "https://github.com/napopa/claude-router",
+  "repository": "https://github.com/napopa/claude-router",
   "license": "MIT",
   "keywords": ["routing", "model-selection", "cost-optimization", "haiku", "sonnet", "opus", "context-forking", "multi-turn"],
   "agents": [
