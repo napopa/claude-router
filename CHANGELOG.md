@@ -2,6 +2,29 @@
 
 All notable changes to Claude Router will be documented in this file.
 
+## [2.1.0] - 2026-04-19
+
+### Changed
+- **Routing rebalanced — Sonnet is now the default for real coding work.** Added a new `sonnet` pattern set to `PATTERNS` covering bug fixes, feature/function implementation, test writing, local refactors, code review, error handling, and rename/extract/inline operations. `classify_by_rules()` now counts `sonnet_signals` and routes `sonnet_signals >= 2` to `standard @ 0.9`, single `sonnet` signal to `standard @ 0.75`.
+- **No-pattern fallback flipped.** Very short prompts (<60 chars) stay on `fast @ 0.8` (true lookups). Short prompts (60-199 chars) now route to `standard @ 0.6` so the LLM fallback can reclassify when a key is present. Long prompts (>=200 chars) route to `standard @ 0.55`. Previously everything non-pattern-matching landed on `fast`.
+- **Context-boost promotes follow-ups.** When the last route was `standard` or `deep` and the current classification is `fast`, the follow-up is promoted to `standard` (not merely bumped in confidence within `fast`). Confidence is kept under 0.7 so the LLM fallback can still correct.
+- **`deep` patterns widened** to catch subject-verb-inverted forms (e.g., "design a multi-tenant auth system") via a new `\bdesign\b.{0,40}\b(system|service|...)\b` pattern.
+- **LLM fallback prompt rewritten** to frame `standard` as the default route. Previous wording listed routes neutrally; Haiku tended to pick `fast` on ambiguity. New prompt explicitly says "Default to 'standard' when uncertain."
+
+### Fixed
+- **Cache-lookup regex.** The previous `.*? ... $` + `re.DOTALL` pattern was pathological — `$` matches at every `\n`, letting `.*?` collapse to zero characters and returning truncated entries. Replaced with `[\s\S]*? ... \Z` for unambiguous "match up to next entry or end-of-string." Also `re.escape()` the fingerprint.
+- **Cache-eviction regex.** The `findall` approach mishandled trailing whitespace and entries missing a `**Last used:**` line. Replaced with an explicit `re.split(r'(?=^## \[)')` → sort by date → drop oldest pipeline. Missing dates now sort as epoch-0.
+- **Truncate-before-lock race.** `write_classification_cache()` and `log_routing_decision()` previously did `open('w')` → `flock()`, leaving a window where readers saw an empty file. Both sites now use an `_atomic_write(path, content)` helper (temp file + `os.replace()`). Concurrent writers degrade to last-writer-wins instead of file corruption.
+- **Exception queries bypass the routing directive.** Prompts like "what does the router do?", "audit the router", or "how does the router work" no longer receive a `Task()` directive. They still count under `exceptions.router_meta`; the main agent answers them directly. Matches the documented `CLAUDE.md` exception behavior.
+- **Exception patterns widened** to cover `(audit|review|fix|debug) ... router`, `(what|how|why) ... router ... (do|does|work|say)`, and `router ... (explain|describe|docs)`.
+- **`get_knowledge_dir()` hardened.** Removed the `Path.cwd() / "knowledge"` fallback. A hostile `knowledge/` directory in the launch cwd can no longer hijack knowledge lookups.
+
+### Removed
+- **Dead in-memory caches.** `_MEMORY_CACHE` (classification cache) and `_KEYWORDS_CACHE` (learning keywords cache) along with `_MEMORY_CACHE_MAX`. The hook runs once per prompt, so these process-local dicts never survived between invocations — they were populated, then the process exited. File cache remains the only persistence layer.
+- **Duplicated constant definitions.** `SHORT_PROMPT_CHARS`, `LLM_HEAD_CHARS`, `LLM_TAIL_CHARS` (plus the new `VERY_SHORT_CHARS`) now live at module top instead of mid-file below `classify_by_rules()`.
+
+---
+
 ## [2.0.10] - 2026-04-18
 
 ### Changed

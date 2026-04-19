@@ -5,7 +5,11 @@ Classifies prompts using hybrid approach:
 1. Rule-based patterns (instant, free)
 2. Haiku LLM fallback for low-confidence cases (~$0.001)
 
-Part of claude-router: https://github.com/0xrdan/claude-router
+Cache strategy: file-cache only; per-process in-memory cache removed in v2.1.0
+(the hook runs once per prompt so process-local dicts never survived
+between invocations).
+
+Part of claude-router: https://github.com/napopa/claude-router
 """
 from __future__ import annotations
 import json
@@ -33,6 +37,21 @@ else:
     def unlock_file(f):
         fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Atomic write: temp file + os.replace().
+
+    Avoids the truncate-before-lock race where another reader could see
+    an empty file in the window between open('w') (which truncates) and
+    flock() acquisition. On POSIX os.replace() is atomic; concurrent
+    writers degrade to last-writer-wins instead of file corruption.
+    """
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    with open(tmp, 'w') as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
 # Confidence threshold for LLM fallback
 CONFIDENCE_THRESHOLD = 0.7
 
@@ -49,19 +68,26 @@ EXCEPTION_PATTERNS = [
     re.compile(r'claude.?router'),
     re.compile(r'\bexception\b.*\b(track|detect)'),
     re.compile(r'\bclassif(y|ication)\b.*\b(prompt|query)'),
+    # Widened in v2.1.0: natural phrasings for router meta-questions
+    re.compile(r'\b(audit|review|fix|debug)\b.{0,40}\brouter\b'),
+    re.compile(r'\b(what|how|why)\b.{0,30}\brouter\b.{0,30}\b(do|does|work|say)\b'),
+    re.compile(r'\brouter\b.{0,30}\b(explain|describe|docs)\b'),
 ]
 
 # Classification cache settings
 CACHE_MAX_ENTRIES = 100
 CACHE_TTL_DAYS = 30
 
-# In-memory cache for extracted learning keywords (mtime-based invalidation)
-_KEYWORDS_CACHE = {"keywords": None, "mtime": 0}
-
-# In-memory classification cache (avoids file I/O for repeated queries in same session)
-# LRU-style: limited to 50 entries, cleared on process restart
-_MEMORY_CACHE = {}
-_MEMORY_CACHE_MAX = 50
+# Prompt length cutoffs (used by classify_by_rules() no-pattern fallback).
+# Very short prompts are almost always true lookups; short prompts are
+# usually real work and get promoted to standard so the LLM fallback can
+# correct them; long prompts always get LLM fallback when a key is present.
+VERY_SHORT_CHARS = 60
+SHORT_PROMPT_CHARS = 200
+# For longer prompts we still run the LLM fallback, but the middle of a
+# 10KB stack trace adds no classification signal. Head+tail is enough.
+LLM_HEAD_CHARS = 500
+LLM_TAIL_CHARS = 200
 
 # Session state file for multi-turn context awareness
 SESSION_STATE_FILE = Path.home() / ".claude" / "router-session.json"
@@ -162,9 +188,12 @@ def is_follow_up_query(prompt: str) -> bool:
 
 
 def apply_context_boost(result: dict, session_state: dict, is_follow_up: bool) -> dict:
-    """Apply confidence boost based on conversation context.
+    """Apply a route/confidence adjustment based on conversation context.
 
-    If this is a follow-up to a deep/complex query, boost confidence toward same route.
+    v2.1.0: when the last route was standard/deep and the current
+    classification is fast, actually promote to standard (not merely
+    bump confidence inside fast). Confidence stays under 0.7 so the
+    LLM fallback can still correct if it disagrees.
     """
     if not is_follow_up:
         return result
@@ -176,28 +205,27 @@ def apply_context_boost(result: dict, session_state: dict, is_follow_up: bool) -
     result["metadata"] = result.get("metadata", {})
     result["metadata"]["follow_up"] = True
 
-    # If last route was deep/standard, boost current toward same
-    # (follow-ups to complex queries are often also complex)
     if last_route in ("deep", "standard") and result["route"] == "fast":
-        if result["confidence"] < 0.8:
-            result["confidence"] = min(0.75, result["confidence"] + 0.15)
-            result["metadata"]["context_boost"] = f"follow_up_to_{last_route}"
-            # Don't change route, just boost confidence to potentially trigger LLM
+        current_confidence = result.get("confidence", 0.5)
+        result["route"] = "standard"
+        result["confidence"] = min(0.65, max(current_confidence, 0.6))
+        result["metadata"]["context_boost"] = f"follow_up_to_{last_route}"
 
     return result
 
 
 def get_knowledge_dir() -> Path:
-    """Get the knowledge directory path (project-local)."""
-    # Try to find knowledge/ relative to this script's location
+    """Get the knowledge directory path (project-local).
+
+    Only looks at knowledge/ relative to this script's location.
+    The prior Path.cwd() fallback was removed in v2.1.0 — it let a
+    hostile `knowledge/` directory in the user's cwd hijack knowledge
+    lookups if Claude Code was launched from that directory.
+    """
     script_dir = Path(__file__).parent.parent  # Go up from hooks/ to project root
     knowledge_dir = script_dir / "knowledge"
     if knowledge_dir.exists():
         return knowledge_dir
-    # Fallback: check current working directory
-    cwd_knowledge = Path.cwd() / "knowledge"
-    if cwd_knowledge.exists():
-        return cwd_knowledge
     return None
 
 def generate_fingerprint(prompt: str) -> str:
@@ -223,18 +251,8 @@ def generate_fingerprint(prompt: str) -> str:
     return hashlib.md5(fingerprint_str.encode()).hexdigest()[:12]
 
 def check_classification_cache(prompt: str) -> dict:
-    """Check if a similar query exists in the cache.
-
-    Checks in-memory cache first (fastest), then falls back to file cache.
-    """
+    """Check if a similar query exists in the file cache."""
     fingerprint = generate_fingerprint(prompt)
-
-    # Check in-memory cache first (no I/O)
-    if fingerprint in _MEMORY_CACHE:
-        result = _MEMORY_CACHE[fingerprint].copy()
-        result["metadata"] = result.get("metadata", {})
-        result["metadata"]["memory_cache_hit"] = True
-        return result
 
     try:
         knowledge_dir = get_knowledge_dir()
@@ -248,9 +266,12 @@ def check_classification_cache(prompt: str) -> dict:
         with open(cache_file, 'r') as f:
             content = f.read()
 
-        # Look for matching fingerprint section
-        pattern = rf'## \[{fingerprint}\].*?(?=\n## \[|$)'
-        match = re.search(pattern, content, re.DOTALL)
+        # Look for matching fingerprint section.
+        # `[\s\S]*?` + `\Z` gives unambiguous "up to next entry or end-of-string";
+        # the prior `.*? + re.DOTALL + $` combo was pathological because `$`
+        # matches at every `\n`, letting `.*?` collapse to zero characters.
+        pattern = rf'## \[{re.escape(fingerprint)}\][\s\S]*?(?=\n## \[|\Z)'
+        match = re.search(pattern, content)
 
         if not match:
             return None
@@ -262,16 +283,13 @@ def check_classification_cache(prompt: str) -> dict:
         conf_match = re.search(r'\*\*Confidence:\*\* ([\d.]+)', entry)
 
         if route_match and conf_match:
-            result = {
+            return {
                 "route": route_match.group(1),
                 "confidence": float(conf_match.group(1)),
                 "signals": ["cache_hit"],
                 "method": "cache",
                 "metadata": {"cache_hit": True, "fingerprint": fingerprint}
             }
-            # Populate memory cache for faster subsequent lookups
-            _MEMORY_CACHE[fingerprint] = result.copy()
-            return result
 
         return None
     except Exception:
@@ -279,26 +297,13 @@ def check_classification_cache(prompt: str) -> dict:
         return None
 
 def write_classification_cache(prompt: str, result: dict):
-    """Write a classification result to the cache.
+    """Write a classification result to the file cache.
 
-    Writes to both in-memory cache (fast) and file cache (persistent).
+    Atomic via _atomic_write() — temp file + os.replace() — so concurrent
+    writers never see a half-truncated file. Per-process in-memory cache
+    was removed in v2.1.0 (hook runs once per prompt, so it never helped).
     """
-    global _MEMORY_CACHE
-
     fingerprint = generate_fingerprint(prompt)
-
-    # Write to memory cache first (always, even if file cache fails)
-    # Simple LRU: if at max, remove oldest entry
-    if len(_MEMORY_CACHE) >= _MEMORY_CACHE_MAX:
-        # Remove first (oldest) entry
-        oldest_key = next(iter(_MEMORY_CACHE))
-        del _MEMORY_CACHE[oldest_key]
-    _MEMORY_CACHE[fingerprint] = {
-        "route": result["route"],
-        "confidence": result["confidence"],
-        "signals": result.get("signals", []),
-        "method": "cache",
-    }
 
     try:
         knowledge_dir = get_knowledge_dir()
@@ -309,7 +314,6 @@ def write_classification_cache(prompt: str, result: dict):
         if not cache_file.exists():
             return
 
-        # fingerprint already generated above for memory cache
         today = datetime.now().strftime("%Y-%m-%d")
 
         # Read existing cache
@@ -319,19 +323,17 @@ def write_classification_cache(prompt: str, result: dict):
         # Check if this fingerprint already exists
         if f'## [{fingerprint}]' in content:
             # Update last used date and hit count
-            pattern = rf'(## \[{fingerprint}\].*?\*\*Last used:\*\* )\d{{4}}-\d{{2}}-\d{{2}}'
-            content = re.sub(pattern, rf'\g<1>{today}', content, flags=re.DOTALL)
+            fp = re.escape(fingerprint)
+            pattern = rf'(## \[{fp}\][\s\S]*?\*\*Last used:\*\* )\d{{4}}-\d{{2}}-\d{{2}}'
+            content = re.sub(pattern, rf'\g<1>{today}', content)
 
-            hit_pattern = rf'(## \[{fingerprint}\].*?\*\*Hit count:\*\* )(\d+)'
-            hit_match = re.search(hit_pattern, content, re.DOTALL)
+            hit_pattern = rf'(## \[{fp}\][\s\S]*?\*\*Hit count:\*\* )(\d+)'
+            hit_match = re.search(hit_pattern, content)
             if hit_match:
                 new_count = int(hit_match.group(2)) + 1
-                content = re.sub(hit_pattern, rf'\g<1>{new_count}', content, flags=re.DOTALL)
+                content = re.sub(hit_pattern, rf'\g<1>{new_count}', content)
 
-            with open(cache_file, 'w') as f:
-                lock_file(f, exclusive=True)
-                f.write(content)
-                unlock_file(f)
+            _atomic_write(cache_file, content)
             return
 
         # Create new entry
@@ -352,16 +354,20 @@ def write_classification_cache(prompt: str, result: dict):
         # Count existing entries
         entry_count = len(re.findall(r'^## \[', content, re.MULTILINE))
 
-        # If at max, evict oldest entry (by last used date)
+        # If at max, evict the oldest entry by Last-used date. Use split()
+        # rather than a .*? regex — the prior findall approach mishandled
+        # trailing whitespace and entries missing a "Last used:" line.
         if entry_count >= CACHE_MAX_ENTRIES:
-            # Find all entries with their dates
-            entries = re.findall(r'(## \[[^\]]+\].*?\*\*Last used:\*\* (\d{4}-\d{2}-\d{2}).*?)(?=\n## \[|$)',
-                                content, re.DOTALL)
+            sections = re.split(r'(?=^## \[)', content, flags=re.MULTILINE)
+            preamble, entries = sections[0], sections[1:]
             if entries:
-                # Sort by date and remove oldest
-                entries_sorted = sorted(entries, key=lambda x: x[1])
-                oldest_entry = entries_sorted[0][0]
-                content = content.replace(oldest_entry, '')
+                def entry_date(e: str) -> str:
+                    m = re.search(r'\*\*Last used:\*\*\s*(\d{4}-\d{2}-\d{2})', e)
+                    return m.group(1) if m else "0000-00-00"
+                entries.sort(key=entry_date)
+                # Drop the oldest
+                entries = entries[1:]
+                content = preamble + ''.join(entries)
 
         # Append new entry
         content = content.rstrip() + '\n' + entry
@@ -371,10 +377,7 @@ def write_classification_cache(prompt: str, result: dict):
         content = re.sub(r'entry_count: \d+', f'entry_count: {new_count}', content)
         content = re.sub(r'last_updated: .*', f'last_updated: "{datetime.now().isoformat()}"', content)
 
-        with open(cache_file, 'w') as f:
-            lock_file(f, exclusive=True)
-            f.write(content)
-            unlock_file(f)
+        _atomic_write(cache_file, content)
 
     except Exception:
         # Cache errors should never break classification
@@ -397,26 +400,16 @@ def get_learning_state() -> dict:
 def extract_learning_keywords() -> dict:
     """Extract keywords from learnings files to inform routing.
 
-    Uses mtime-based caching to avoid re-parsing files on every call.
+    (Process-local mtime cache removed in v2.1.0 — the hook runs once per
+    prompt so it could not persist across calls.)
     """
-    global _KEYWORDS_CACHE
-
     try:
         knowledge_dir = get_knowledge_dir()
         if not knowledge_dir:
             return {"deep_keywords": set(), "fast_keywords": set()}
 
-        # Check file modification times for cache invalidation
         quirks_file = knowledge_dir / "learnings" / "quirks.md"
         patterns_file = knowledge_dir / "learnings" / "patterns.md"
-
-        quirks_mtime = quirks_file.stat().st_mtime if quirks_file.exists() else 0
-        patterns_mtime = patterns_file.stat().st_mtime if patterns_file.exists() else 0
-        current_mtime = max(quirks_mtime, patterns_mtime)
-
-        # Return cached result if files haven't changed
-        if _KEYWORDS_CACHE["keywords"] is not None and _KEYWORDS_CACHE["mtime"] >= current_mtime:
-            return _KEYWORDS_CACHE["keywords"]
 
         deep_keywords = set()
         fast_keywords = set()
@@ -447,13 +440,7 @@ def extract_learning_keywords() -> dict:
                         words = re.findall(r'\b[a-z]{3,}\b', insight_match.group(1).lower())
                         fast_keywords.update(words)
 
-        result = {"deep_keywords": deep_keywords, "fast_keywords": fast_keywords}
-
-        # Cache the result with current mtime
-        _KEYWORDS_CACHE["keywords"] = result
-        _KEYWORDS_CACHE["mtime"] = current_mtime
-
-        return result
+        return {"deep_keywords": deep_keywords, "fast_keywords": fast_keywords}
     except Exception:
         return {"deep_keywords": set(), "fast_keywords": set()}
 
@@ -522,9 +509,31 @@ PATTERNS = {
         re.compile(r"\bsyntax (for|of)\b"),
         re.compile(r"^(what|how).{0,50}\?$"),
     ],
+    "sonnet": [
+        # Bug fixes
+        re.compile(r"\b(fix|debug|resolve)\b.{0,40}\b(bug|issue|error|problem|failure)\b"),
+        # Feature/function implementation
+        re.compile(r"\b(implement|build|create|add)\b.{0,40}\b(feature|function|method|class|endpoint|component|decorator|module|utility|helper|script|handler|hook|middleware)\b"),
+        # Test writing
+        re.compile(r"\b(write|add|create)\b.{0,30}\btests?\b"),
+        # Local refactor (not broad refactors — those are deep)
+        re.compile(r"\brefactor\b(?!.{0,30}(codebase|project|entire|across))"),
+        # Code review / improvement
+        re.compile(r"\b(review|improve|clean up)\b.{0,30}\bcode\b"),
+        # Small file-level modifications
+        re.compile(r"\b(update|modify|change)\b.{0,40}\b(function|method|class|file)\b"),
+        # Serialization / validation
+        re.compile(r"\b(parse|serialize|deserialize|validate|sanitize)\b"),
+        # Error/exception handling
+        re.compile(r"\b(handle|catch|raise|throw)\b.{0,30}\b(error|exception|edge case)\b"),
+        # Local refactors
+        re.compile(r"\b(rename|extract|inline)\b.{0,30}\b(variable|function|method)\b"),
+    ],
     "deep": [
         # Architecture
         re.compile(r"\b(architect|architecture|design pattern|system design)\b"),
+        # Subject-verb-inverted design ("design a multi-tenant auth system")
+        re.compile(r"\bdesign\b.{0,40}\b(system|service|platform|pipeline|architecture)\b"),
         re.compile(r"\bscalable?\b"),
         # Security
         re.compile(r"\b(security|vulnerab|audit|penetration|exploit)\b"),
@@ -692,11 +701,10 @@ def log_routing_decision(route: str, confidence: float, method: str, signals: li
 
         stats["last_updated"] = datetime.now().isoformat()
 
-        # Write stats atomically
-        with open(STATS_FILE, "w") as f:
-            lock_file(f, exclusive=True)
-            json.dump(stats, f, indent=2)
-            unlock_file(f)
+        # Atomic write: temp + os.replace() avoids the truncate-before-lock
+        # race where readers could see an empty file during open('w').
+        # Concurrent writers degrade to last-writer-wins — no corruption.
+        _atomic_write(STATS_FILE, json.dumps(stats, indent=2))
 
     except Exception:
         # Don't fail the hook if stats logging fails
@@ -709,10 +717,14 @@ def classify_by_rules(prompt: str) -> dict:
     Returns route, confidence, signals, and optional metadata.
 
     Priority order:
-    1. deep patterns (architecture, security, complex analysis)
-    2. tool_intensive patterns (route to standard, or deep if combined)
-    3. orchestration patterns (route to deep with orchestration flag)
-    4. fast patterns (simple queries)
+    1. deep + orchestration (opus-orchestrator)
+    2. deep + tool-intensive (deep-executor)
+    3. deep alone (deep-executor)
+    4. tool_intensive alone (standard-executor)
+    5. orchestration alone (standard-executor)
+    6. sonnet patterns (standard-executor — bulk of real coding work)
+    7. fast patterns (fast-executor — trivial lookups)
+    8. No-pattern fallback (very short → fast; otherwise → standard)
 
     Optimized with early exit when sufficient signals are found.
     """
@@ -720,6 +732,7 @@ def classify_by_rules(prompt: str) -> dict:
     deep_signals = []
     tool_signals = []
     orch_signals = []
+    sonnet_signals = []
 
     # Check for deep patterns first (highest priority)
     # Pre-compiled patterns use .search() method directly
@@ -749,6 +762,14 @@ def classify_by_rules(prompt: str) -> dict:
             if deep_signals:
                 break
 
+    # Check for sonnet patterns (real coding work: bug fixes, features, tests)
+    for pattern in PATTERNS.get("sonnet", []):
+        match = pattern.search(prompt_lower)
+        if match:
+            sonnet_signals.append(match.group(0))
+            if len(sonnet_signals) >= 3:
+                break
+
     # Decision matrix. Orchestration-to-opus-orchestrator is narrow: we only
     # trigger it when a deep signal co-occurs with an *orchestration* signal
     # (multi-step / for-each / explicit multi-task). deep+tool alone routes to
@@ -776,6 +797,8 @@ def classify_by_rules(prompt: str) -> dict:
             "metadata": {"tool_intensive": True}
         }
 
+    # Deep wins over sonnet when both fire (architectural / security concerns
+    # are higher-priority than the implementation signals that co-occur with them).
     if len(deep_signals) >= 2:
         return {"route": "deep", "confidence": 0.9, "signals": deep_signals[:3], "method": "rules"}
 
@@ -810,6 +833,15 @@ def classify_by_rules(prompt: str) -> dict:
             "metadata": {"orchestration": True}
         }
 
+    # Sonnet signals = real coding work (bug fixes, feature impl, tests,
+    # local refactors). This is the bulk of what the router sees and it
+    # should go to standard, not fast.
+    if len(sonnet_signals) >= 2:
+        return {"route": "standard", "confidence": 0.9, "signals": sonnet_signals[:3], "method": "rules"}
+
+    if sonnet_signals:  # One sonnet signal
+        return {"route": "standard", "confidence": 0.75, "signals": sonnet_signals, "method": "rules"}
+
     # Check for fast patterns
     fast_signals = []
     for pattern in PATTERNS["fast"]:
@@ -822,30 +854,32 @@ def classify_by_rules(prompt: str) -> dict:
     if fast_signals:  # One fast signal
         return {"route": "fast", "confidence": 0.7, "signals": fast_signals, "method": "rules"}
 
-    # Default to fast. For short prompts (rarely genuinely complex), use a
-    # confidence above CONFIDENCE_THRESHOLD so we skip the Haiku fallback —
-    # it would cost more than it saves on a one-liner question. Longer
-    # prompts with no pattern hit stay at low confidence so the LLM gets a
-    # chance to reclassify them.
-    if len(prompt) <= SHORT_PROMPT_CHARS:
+    # No pattern matched. Reversed in v2.1.0 — default is now standard, not fast.
+    # - Very short (<VERY_SHORT_CHARS): likely a true lookup, stay on fast above
+    #   the LLM threshold so we don't pay Haiku for "list files".
+    # - Short (VERY_SHORT..SHORT): likely real work; confidence below threshold
+    #   so the LLM fallback gets a chance when a key is present.
+    # - Long (>=SHORT_PROMPT_CHARS): clearly real work; LLM fallback if possible.
+    if len(prompt) < VERY_SHORT_CHARS:
         return {
             "route": "fast",
-            "confidence": 0.75,
-            "signals": ["short prompt, no strong patterns"],
+            "confidence": 0.8,
+            "signals": ["very short prompt, no patterns"],
             "method": "rules",
         }
-    return {"route": "fast", "confidence": 0.5, "signals": ["no strong patterns"], "method": "rules"}
-
-
-# Prompt length cutoffs
-# Short prompts rarely benefit from Haiku classification — they are either
-# clearly simple ("list files", "what is X") or clearly routed by rules.
-# Giving them elevated default confidence skips the LLM fallback entirely.
-SHORT_PROMPT_CHARS = 200
-# For longer prompts we still run the LLM fallback, but the middle of a
-# 10KB stack trace adds no classification signal. Head+tail is enough.
-LLM_HEAD_CHARS = 500
-LLM_TAIL_CHARS = 200
+    if len(prompt) < SHORT_PROMPT_CHARS:
+        return {
+            "route": "standard",
+            "confidence": 0.6,
+            "signals": ["short prompt, no patterns"],
+            "method": "rules",
+        }
+    return {
+        "route": "standard",
+        "confidence": 0.55,
+        "signals": ["no strong patterns"],
+        "method": "rules",
+    }
 
 
 def truncate_for_llm(prompt: str) -> str:
@@ -875,21 +909,16 @@ def classify_by_llm(prompt: str, api_key: str) -> dict:
 
     truncated = truncate_for_llm(prompt)
 
-    classification_prompt = f"""Classify this coding query into exactly one route. Return ONLY valid JSON, no other text.
+    classification_prompt = f"""Classify this coding query. Most real coding work is "standard" — only pick "fast" for trivial lookups and "deep" for genuinely architectural work. Return ONLY valid JSON, no other text.
 
 Query: "{truncated}"
 
 Routes:
-- "fast": Simple factual questions, syntax lookups, formatting, git status, JSON/YAML manipulation
-- "standard": Bug fixes, feature implementation, code review, refactoring, test writing, OR tool-intensive tasks (codebase search, running tests, multi-file edits)
-- "deep": Architecture decisions, system design, security audits, multi-file refactors, trade-off analysis, complex debugging, OR orchestration tasks (multi-step workflows)
+- "fast": status checks, syntax lookups, format/lint commands, single-line factual answers. If you'd answer in <50 words, it's fast.
+- "standard" (DEFAULT): bug fixes, feature implementation, writing/modifying functions, code review, local refactoring, writing tests. Anything where you'd actually open a file and edit it.
+- "deep": architecture/design decisions, security audits, multi-file refactors across an unfamiliar codebase, trade-off analysis with non-obvious answers, orchestration of >3 distinct steps.
 
-Tool-intensity indicators (favor "standard" or "deep" over "fast"):
-- Searching/scanning entire codebase
-- Modifying multiple files
-- Running tests or builds
-- Dependency analysis
-- Large-scale refactoring
+Default to "standard" when uncertain.
 
 Return JSON only:
 {{"route": "fast|standard|deep", "confidence": 0.0-1.0, "signals": ["signal1", "signal2"], "tool_intensive": true|false}}"""
@@ -1055,8 +1084,21 @@ Task(subagent_type="claude-router:{subagent}", prompt="<last query from session>
         # Skip other slash commands (let skills handle them)
         sys.exit(0)
 
-    # Check for exception queries (router meta-questions)
+    # Check for exception queries (router meta-questions).
+    # In v2.1.0, exception queries fully bypass the routing directive:
+    # they still increment the router_meta counter, but do not emit the
+    # Task() directive — the main agent answers the user directly.
+    # Matches the documented behavior in CLAUDE.md.
     is_exception, exception_type = is_exception_query(prompt)
+    if is_exception:
+        log_routing_decision(
+            route="fast",  # placeholder; 'route' is required but we count under exceptions
+            confidence=1.0,
+            method="exception",
+            signals=["router_meta"],
+            metadata={"exception_type": exception_type},
+        )
+        sys.exit(0)
 
     # Load session state once and thread it through classify + update below.
     session_state = get_session_state()
@@ -1071,10 +1113,6 @@ Task(subagent_type="claude-router:{subagent}", prompt="<last query from session>
 
     # Get metadata for orchestration/tool-intensive routing
     metadata = result.get("metadata", {})
-
-    # Track exception if detected
-    if is_exception:
-        metadata["exception_type"] = exception_type
 
     # Log routing decision to stats
     log_routing_decision(route, confidence, method, signals, metadata)
